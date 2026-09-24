@@ -1,0 +1,7 @@
+version: 1
+rules:
+  - id: no-force-push
+    on: shell_exec
+    checks:
+      - regex: '\bgit\s+push\s+--force\b'
+    message: 请检查远端分支，避免强制推送。

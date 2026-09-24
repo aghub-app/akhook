@@ -1,0 +1,11 @@
+version: 1
+rules:
+  - id: no-box-leak
+    on: file_change
+    paths: ["**/*.rs"]
+    actions: [create, modify]
+    checks:
+      - ast:
+          language: rust
+          pattern: 'Box::leak($VALUE)'
+    message: 请改用不会泄漏内存的写法。

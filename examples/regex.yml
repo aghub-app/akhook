@@ -1,0 +1,9 @@
+version: 1
+rules:
+  - id: no-dbg-macro
+    on: file_change
+    paths: ["**/*.rs"]
+    actions: [create, modify]
+    checks:
+      - regex: '\bdbg!\s*\('
+    message: 请移除调试用的 dbg! 宏。
