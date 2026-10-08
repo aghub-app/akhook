@@ -18,6 +18,8 @@ use crate::model::{Candidate, RuleHit, ToolAttempt};
 
 pub const STATE_DIR_ENV: &str = "AKHOOK_STATE_DIR";
 const GRANT_LIFETIME: Duration = Duration::from_secs(600);
+/// Requests nobody answered are dropped after a day.
+const REQUEST_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_INSTRUCTION: &str = "This call needs the user's approval (request {request_id}). \
     Ask the user to approve it; after they run `akhook approval grant {request_id}`, \
     retry exactly the same call.";
@@ -76,6 +78,7 @@ pub fn check(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let dir = state_dir()?;
+    sweep(&dir);
     if take_grant(&dir.join("grants").join(format!("{id}.json")))? {
         return Ok(Outcome::Granted);
     }
@@ -112,6 +115,28 @@ pub fn grant(id: &str) -> Result<()> {
         &Grant { expires_at },
     )?;
     fs::remove_file(&request).with_context(|| format!("removing {}", request.display()))
+}
+
+/// Removes expired grants and stale requests. Each hook process is short
+/// lived, so this runs whenever an `ask` rule hits. Best effort: a failed
+/// cleanup must not decide the tool call.
+fn sweep(dir: &Path) {
+    for (folder, lifetime) in [("grants", GRANT_LIFETIME), ("requests", REQUEST_LIFETIME)] {
+        let Ok(entries) = fs::read_dir(dir.join(folder)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= lifetime);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn take_grant(path: &Path) -> Result<bool> {
@@ -166,4 +191,39 @@ fn now() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use super::*;
+
+    #[test]
+    fn sweep_removes_expired_grants_and_stale_requests_only() {
+        let dir = std::env::temp_dir().join(format!("akhook-sweep-{}", std::process::id()));
+        let file = |folder: &str, name: &str, age: Duration| {
+            let path = dir.join(folder).join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+            path
+        };
+        let old_grant = file("grants", "a.json", GRANT_LIFETIME + Duration::from_secs(1));
+        let new_grant = file("grants", "b.json", Duration::from_secs(1));
+        let old_request = file(
+            "requests",
+            "c.json",
+            REQUEST_LIFETIME + Duration::from_secs(1),
+        );
+        let new_request = file("requests", "d.json", GRANT_LIFETIME * 2);
+        sweep(&dir);
+        assert!(!old_grant.exists());
+        assert!(new_grant.exists());
+        assert!(!old_request.exists());
+        assert!(new_request.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
