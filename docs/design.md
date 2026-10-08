@@ -14,7 +14,7 @@ akhook approval grant <id>          # 用户同意后放行该调用一次
 
 所有命令都接受可重复的 `--add-config-path <PATH>`，也读取环境变量 `AKHOOK_ADDITIONAL_CONFIG_PATH`（按系统路径列表分隔）；见下文“附加配置”。
 
-首版 `agent` 为 `claude` 或 `codex`。`init` 要求 `akhook` 已在 `PATH` 上，因为登记的命令直接使用这个名字。它在 agent 的现有设置中合并 akhook 登记，重复运行不重复添加，也不改动其他 hook：
+首版 `agent` 为 `claude` 或 `codex`。`init` 要求 `akhook` 已在 `PATH` 上，因为登记的命令直接使用这个名字。它在 agent 的现有设置中合并 akhook 登记，重复运行不重复添加，也不改动其他 hook。登记不带 `matcher`，每次工具调用都交给 akhook，由 adapter 决定处理哪些工具、其余直接放行；这样 akhook 支持新的工具时不需要重新登记。早期版本登记时带的 matcher，重新运行 `init` 会去掉：
 
 | agent | 项目登记 | 用户登记 | 固定命令 |
 |---|---|---|---|

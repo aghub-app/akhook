@@ -13,10 +13,6 @@ impl Agent for Codex {
         "akhook codex hook pre_tool_use"
     }
 
-    fn matcher(&self) -> &'static str {
-        "^(Bash|apply_patch)$"
-    }
-
     fn settings_file(&self, global: bool, root: &Path) -> Result<PathBuf> {
         settings_path(global, root, ".codex", "hooks.json")
     }
