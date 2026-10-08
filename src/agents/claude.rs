@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{Agent, attempt, cwd, deny, event, field, resolve, settings_path};
+use super::{Agent, attempt, cwd, decision, deny, event, field, resolve, settings_path};
 use crate::model::{Candidate, FileAction, ToolAttempt};
 
 pub struct Claude;
@@ -58,5 +58,9 @@ impl Agent for Claude {
 
     fn deny_json(&self, reason: &str) -> Value {
         deny(reason)
+    }
+
+    fn ask_json(&self, reason: &str) -> Option<Value> {
+        Some(decision("ask", reason))
     }
 }
