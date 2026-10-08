@@ -32,6 +32,7 @@ impl Env {
             .args(args)
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("AKHOOK_STATE_DIR", self.root.join("state"))
             .env_remove("AKHOOK_ADDITIONAL_CONFIG_PATH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -156,4 +157,51 @@ fn additional_configs_cannot_be_disabled_by_the_project() {
         )
         .unwrap();
     assert!(reason.contains("could not check"));
+}
+
+#[test]
+fn ask_uses_native_ask_on_claude_and_one_time_grants_on_codex() {
+    let env = Env::new(
+        "version: 1
+ask_instruction: 'call request_approval({request_id})'
+rules:
+  - id: push
+    on: shell_exec
+    action: ask
+    checks:
+      - argv: [git, push]
+    message: pushing needs approval
+",
+    );
+    let (decision, _) = env.bash("claude", "git push", &[], &[]).unwrap();
+    assert_eq!(decision, "ask");
+
+    let (decision, reason) = env.bash("codex", "git push", &[], &[]).unwrap();
+    assert_eq!(decision, "deny");
+    let id = reason
+        .split("request_approval(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap()
+        .to_owned();
+    let shown = env.akhook(&["approval", "show", &id], "", &[]);
+    assert!(shown.status.success());
+    let request: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(request["rules"][0]["message"], "pushing needs approval");
+    assert_eq!(request["candidates"][0]["command"], "git push");
+
+    // A different call is not covered by the grant.
+    assert!(
+        env.akhook(&["approval", "grant", &id], "", &[])
+            .status
+            .success()
+    );
+    assert!(env.bash("codex", "git push --force", &[], &[]).is_some());
+    assert!(env.bash("codex", "git push", &[], &[]).is_none());
+    assert!(env.bash("codex", "git push", &[], &[]).is_some());
+    assert!(
+        !env.akhook(&["approval", "grant", "0000000000000000"], "", &[])
+            .status
+            .success()
+    );
 }

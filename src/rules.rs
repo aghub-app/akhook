@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    config::{ArgvItem, CheckSpec, LoadedConfig, RuleEvent},
+    config::{ArgvItem, CheckSpec, LoadedConfig, RuleAction, RuleEvent},
     model::{Candidate, Decision, FileAction, RuleHit, ToolAttempt},
     shell,
 };
@@ -36,6 +36,7 @@ struct Rule {
     actions: Vec<FileAction>,
     checks: Vec<Check>,
     message: String,
+    action: RuleAction,
 }
 
 enum Check {
@@ -54,6 +55,7 @@ enum Check {
 pub struct RuleSet {
     root: PathBuf,
     rules: Vec<Rule>,
+    pub ask_instruction: Option<String>,
 }
 
 impl RuleSet {
@@ -143,12 +145,14 @@ impl RuleSet {
                     actions: spec.actions,
                     checks,
                     message: spec.message,
+                    action: spec.action.unwrap_or(RuleAction::Deny),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             root: config.root,
             rules,
+            ask_instruction: config.ask_instruction,
         })
     }
 
@@ -165,17 +169,14 @@ impl RuleSet {
                         hits.push(RuleHit {
                             id: rule.id.clone(),
                             message,
+                            action: rule.action,
                         });
                     }
                     break;
                 }
             }
         }
-        Ok(if hits.is_empty() {
-            Decision::Allow
-        } else {
-            Decision::Deny(hits)
-        })
+        Ok(Decision::from_hits(hits))
     }
 }
 
@@ -358,6 +359,7 @@ mod tests {
         let rules = RuleSet::new(LoadedConfig {
             root: root.clone(),
             rules: preset::omp_rules().unwrap(),
+            ask_instruction: None,
         })
         .unwrap();
         let attempt = |path: &str, text: &str| ToolAttempt {

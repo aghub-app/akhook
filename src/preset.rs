@@ -121,6 +121,7 @@ pub fn omp_rules() -> Result<Vec<RuleSpec>> {
                 actions: vec![FileAction::Create, FileAction::Modify],
                 checks,
                 message: body.trim().to_string(),
+                action: None,
             })
         })
         .collect()

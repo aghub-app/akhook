@@ -21,6 +21,8 @@ pub struct Config {
     pub disabled_rules: Vec<String>,
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
+    #[serde(default)]
+    pub ask_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -40,6 +42,17 @@ pub struct RuleSpec {
     pub checks: Vec<CheckSpec>,
     #[garde(custom(non_blank))]
     pub message: String,
+    #[serde(default)]
+    #[garde(skip)]
+    pub action: Option<RuleAction>,
+}
+
+/// What a matched rule does. Without `action` it denies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    Deny,
+    Ask,
 }
 
 fn non_blank(value: &str, _: &()) -> garde::Result {
@@ -105,6 +118,7 @@ fn default_timeout() -> u64 {
 pub struct LoadedConfig {
     pub root: PathBuf,
     pub rules: Vec<RuleSpec>,
+    pub ask_instruction: Option<String>,
 }
 
 /// Additional configs named by `AKHOOK_ADDITIONAL_CONFIG_PATH` (a path list)
@@ -187,12 +201,16 @@ pub fn load(cwd: &Path, additional: &[PathBuf]) -> Result<LoadedConfig> {
         .flatten()
         .chain(&additional);
     let mut use_omp = false;
+    let mut ask_instruction = None;
     for config in layers {
         for name in &config.presets {
             if name != "omp" {
                 bail!("unknown preset {name}");
             }
             use_omp = true;
+        }
+        if config.ask_instruction.is_some() {
+            ask_instruction.clone_from(&config.ask_instruction);
         }
     }
     let mut by_id = BTreeMap::new();
@@ -218,6 +236,7 @@ pub fn load(cwd: &Path, additional: &[PathBuf]) -> Result<LoadedConfig> {
     Ok(LoadedConfig {
         root,
         rules: by_id.into_values().collect(),
+        ask_instruction,
     })
 }
 

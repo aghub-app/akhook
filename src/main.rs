@@ -1,4 +1,5 @@
 mod agents;
+mod approval;
 mod config;
 mod init;
 mod model;
@@ -16,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     agents::{Agent, AgentKind},
+    model::Decision,
     rules::RuleSet,
 };
 
@@ -46,6 +48,19 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// One-time approvals for `ask` rules on agents that cannot ask (Codex).
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    /// Print a pending request as JSON.
+    Show { id: String },
+    /// Let the requested call through once, within ten minutes.
+    Grant { id: String },
 }
 
 #[derive(Subcommand)]
@@ -78,6 +93,15 @@ fn run() -> Result<()> {
         }
         Command::Claude { command } => hook(AgentKind::Claude.adapter(), command, &additional),
         Command::Codex { command } => hook(AgentKind::Codex.adapter(), command, &additional),
+        Command::Approval {
+            command: ApprovalCommand::Show { id },
+        } => {
+            println!("{}", serde_json::to_string_pretty(&approval::show(&id)?)?);
+            Ok(())
+        }
+        Command::Approval {
+            command: ApprovalCommand::Grant { id },
+        } => approval::grant(&id),
     }
 }
 
@@ -94,7 +118,25 @@ fn hook(agent: &dyn Agent, command: AgentCommand, additional: &[PathBuf]) -> Res
             return Ok(None);
         };
         let rules = RuleSet::new(config::load(&attempt.cwd, additional)?)?;
-        Ok::<_, anyhow::Error>(agent.format_decision(rules.evaluate(&attempt)?))
+        let response = match rules.evaluate(&attempt)? {
+            Decision::Allow => None,
+            Decision::Deny(hits) => Some(agent.deny_json(&agents::reason(&hits))),
+            Decision::Ask(hits) => {
+                let reason = agents::reason(&hits);
+                match agent.ask_json(&reason) {
+                    Some(ask) => Some(ask),
+                    None => {
+                        match approval::check(&attempt, &hits, rules.ask_instruction.as_deref())? {
+                            approval::Outcome::Granted => None,
+                            approval::Outcome::Requested(instruction) => {
+                                Some(agent.deny_json(&format!("{reason}\n\n{instruction}")))
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        Ok::<_, anyhow::Error>(response)
     })();
     let response = match result {
         Ok(response) => response,

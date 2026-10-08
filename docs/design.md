@@ -8,6 +8,8 @@ akhook 是一个 Rust CLI：项目在根目录用 `.akhook.yml` 定义规则，�
 akhook init                         # 创建项目配置，交互选择要安装 hook 的 agent
 akhook init --global                # 创建用户配置，交互选择要全局安装 hook 的 agent
 akhook <agent> hook pre_tool_use    # 固定入口：从 stdin 读事件 JSON，向 stdout 写 agent 决策 JSON
+akhook approval show <id>           # 查看一条待确认请求（JSON）
+akhook approval grant <id>          # 用户同意后放行该调用一次
 ```
 
 所有命令都接受可重复的 `--add-config-path <PATH>`，也读取环境变量 `AKHOOK_ADDITIONAL_CONFIG_PATH`（按系统路径列表分隔）；见下文“附加配置”。
@@ -69,6 +71,13 @@ rules:
     checks:
       - argv: [gh, [pr, issue], [merge, close, comment]]
     message: gh 只能用于读取。
+
+  - id: push
+    on: shell_exec
+    action: ask
+    checks:
+      - argv: [git, push]
+    message: 推送需要用户确认。
 ```
 
 `on` 指规范化操作，不是 agent 的工具名。`paths` 和 `actions` 是文件规则的可选过滤器；`checks` 中任一条件命中即命中规则，多个规则命中则合并提示并拒绝整次工具调用。正则使用 Rust 正则语法。`ast` 使用内嵌 ast-grep 库，只检查文件变更新引入的内容；`language` 可省略并按路径推断。删除文件没有新增内容，因此正则和 AST 不对删除操作运行，外部检查器仍可检查其路径与动作。
@@ -78,6 +87,21 @@ rules:
 `omp` preset 默认关闭，由 `presets: [omp]` 显式启用。preset 规则 ID 使用 `omp/<原规则名>`；同 ID 的项目规则覆盖用户级规则，用户级规则覆盖 preset。`disabled_rules` 在合并后关闭对应 ID 的规则。首版将 omp 规则的命中统一映射为**执行前拒绝**，而不是沿用其软提醒时机。
 
 `omp` preset 的来源固定为设计时上游[最新正式版 v18.2.11](https://github.com/can1357/oh-my-pi/releases/tag/v18.2.11)（提交 `e415159`）。该标签的 27 条内置规则及 MIT 许可已放在 [`presets/omp`](../presets/omp/README.md)；运行时解析原规则的条件、路径范围和正文，不以本机安装的 omp 版本或浮动的 `main` 分支为准。
+
+### 动作
+
+规则命中后的动作由 `action` 决定；不填时为 `deny`。
+
+- `action: deny`：拒绝工具调用。
+- `action: ask`：请用户确认。Claude Code 直接返回 `permissionDecision: "ask"`。Codex 会解析 `ask` 但仍然执行工具，所以 akhook 改用一次性授权：见下文“用户确认”。
+
+同一次工具调用中，只要有一条规则的动作为 `deny` 就拒绝，提示只包含拒绝的规则；否则若有 `ask` 就请用户确认。
+
+### 用户确认（Codex）
+
+`ask` 命中且 agent 无法自己询问用户时，akhook 在状态目录（`AKHOOK_STATE_DIR`，默认为系统的用户状态目录下的 `akhook`）写入 `requests/<id>.json`，内容是规则、提示、`cwd` 与候选操作，然后拒绝调用，并在提示后附上说明。说明默认要求用户运行 `akhook approval grant <id>` 后重试同一调用；配置项 `ask_instruction`（后面的配置覆盖前面的）可以替换它，其中 `{request_id}` 会被替换为请求 ID。宿主可以把它换成“调用某个确认工具”，由工具询问用户后执行 `akhook approval grant <id>`。
+
+请求 ID 由命中的规则 ID、`cwd` 和候选操作的哈希得到，因此只有完全相同的调用会对应同一个请求。`grant` 写入 `grants/<id>.json`，十分钟内有效；下一次相同调用删除它并放行，只放行一次。授权文件对 agent 自己可写，所以这是防止 agent 误操作的确认步骤，不是安全边界。
 
 ## Rust 规则接口
 
@@ -106,7 +130,8 @@ enum CheckSpec {
     Argv { argv: Vec<ArgvItem> },
     Command { argv: Vec<String>, timeout_ms: u64 },
 }
-enum Decision { Allow, Deny(Vec<RuleHit>) }
+enum RuleAction { Deny, Ask }
+enum Decision { Allow, Deny(Vec<RuleHit>), Ask(Vec<RuleHit>) }
 
 fn evaluate(rules: &RuleSet, attempt: &ToolAttempt) -> Result<Decision, RuleError>;
 ```

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde_json::{Value, json};
 
-use crate::model::{Decision, ToolAttempt};
+use crate::model::{RuleHit, ToolAttempt};
 
 pub use claude::Claude;
 pub use codex::Codex;
@@ -18,21 +18,15 @@ pub trait Agent {
     fn settings_file(&self, global: bool, root: &Path) -> Result<PathBuf>;
     fn decode(&self, input: &str) -> Result<Option<ToolAttempt>>;
     fn deny_json(&self, reason: &str) -> Value;
+    /// The agent's own "ask the user" decision, if its hooks support one.
+    fn ask_json(&self, reason: &str) -> Option<Value>;
+}
 
-    fn format_decision(&self, decision: Decision) -> Option<Value> {
-        match decision {
-            Decision::Allow => None,
-            Decision::Deny(hits) => Some(
-                self.deny_json(
-                    &hits
-                        .into_iter()
-                        .map(|hit| format!("akhook [{}]: {}", hit.id, hit.message))
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                ),
-            ),
-        }
-    }
+pub fn reason(hits: &[RuleHit]) -> String {
+    hits.iter()
+        .map(|hit| format!("akhook [{}]: {}", hit.id, hit.message))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -94,9 +88,13 @@ fn attempt(value: &Value, cwd: PathBuf, candidates: Vec<crate::model::Candidate>
 }
 
 fn deny(reason: &str) -> Value {
+    decision("deny", reason)
+}
+
+fn decision(decision: &str, reason: &str) -> Value {
     json!({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
+        "permissionDecision": decision,
         "permissionDecisionReason": reason
     }})
 }
