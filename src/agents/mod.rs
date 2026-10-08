@@ -14,7 +14,6 @@ pub use codex::Codex;
 
 pub trait Agent {
     fn command(&self) -> &'static str;
-    fn matcher(&self) -> &'static str;
     fn settings_file(&self, global: bool, root: &Path) -> Result<PathBuf>;
     fn decode(&self, input: &str) -> Result<Option<ToolAttempt>>;
     fn deny_json(&self, reason: &str) -> Value;

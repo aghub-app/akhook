@@ -13,10 +13,6 @@ impl Agent for Claude {
         "akhook claude hook pre_tool_use"
     }
 
-    fn matcher(&self) -> &'static str {
-        "^(Bash|Edit|Write)$"
-    }
-
     fn settings_file(&self, global: bool, root: &Path) -> Result<PathBuf> {
         settings_path(global, root, ".claude", "settings.json")
     }

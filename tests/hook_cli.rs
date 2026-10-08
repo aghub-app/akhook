@@ -74,6 +74,25 @@ fn both_agents_reject_matching_writes_before_execution() {
     let codex = invoke(&root, "codex", "apply_patch", json!({"command": patch})).unwrap();
     assert!(codex.contains("omp/rs-box-leak"));
     assert!(invoke(&root, "codex", "Bash", json!({"command": "echo ok"})).is_none());
+    // Every tool call reaches akhook; those it does not understand pass.
+    assert!(
+        invoke(
+            &root,
+            "codex",
+            "mcp__github__open_pull_request",
+            json!({"head": "x"})
+        )
+        .is_none()
+    );
+    assert!(
+        invoke(
+            &root,
+            "claude",
+            "WebFetch",
+            json!({"url": "https://example.com"})
+        )
+        .is_none()
+    );
     assert!(
         invoke(&root, "codex", "apply_patch", json!({"command": "invalid"}))
             .unwrap()

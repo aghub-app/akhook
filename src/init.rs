@@ -84,17 +84,17 @@ fn has_command(value: &Value, command: &str) -> bool {
     value
         .pointer("/hooks/PreToolUse")
         .and_then(Value::as_array)
-        .is_some_and(|groups| {
-            groups.iter().any(|group| {
-                group
-                    .get("hooks")
-                    .and_then(Value::as_array)
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|hook| {
-                            hook.get("command").and_then(Value::as_str) == Some(command)
-                        })
-                    })
-            })
+        .is_some_and(|groups| groups.iter().any(|group| runs(group, command)))
+}
+
+fn runs(group: &Value, command: &str) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
         })
 }
 
@@ -102,11 +102,13 @@ fn registered(path: &Path, agent: &dyn Agent) -> Result<bool> {
     Ok(has_command(&read_settings(path)?, agent.command()))
 }
 
+/// Registers akhook for every tool call: without a matcher, the agent hands
+/// akhook all of them and the adapter decides which it understands, so
+/// supporting a new tool needs no new registration. An earlier registration
+/// limited to some tools by a matcher is widened in place.
 fn install(path: &Path, agent: &dyn Agent) -> Result<()> {
     let mut value = read_settings(path)?;
-    if has_command(&value, agent.command()) {
-        return Ok(());
-    }
+    let registered = has_command(&value, agent.command());
     let object = value.as_object_mut().expect("validated object");
     let hooks = object.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut().context("hooks must be an object")?;
@@ -114,10 +116,24 @@ fn install(path: &Path, agent: &dyn Agent) -> Result<()> {
     let groups = groups
         .as_array_mut()
         .context("hooks.PreToolUse must be an array")?;
-    groups.push(json!({
-        "matcher": agent.matcher(),
-        "hooks": [{"type": "command", "command": agent.command()}]
-    }));
+    if registered {
+        let mut widened = false;
+        for group in groups
+            .iter_mut()
+            .filter(|group| runs(group, agent.command()))
+        {
+            if let Some(group) = group.as_object_mut() {
+                widened |= group.remove("matcher").is_some();
+            }
+        }
+        if !widened {
+            return Ok(());
+        }
+    } else {
+        groups.push(json!({
+            "hooks": [{"type": "command", "command": agent.command()}]
+        }));
+    }
     fs::create_dir_all(path.parent().context("settings has no parent")?)?;
     let mut output = serde_json::to_string_pretty(&value)?;
     output.push('\n');
@@ -147,6 +163,38 @@ mod tests {
         );
         assert!(has_command(&settings, "other"));
         assert!(has_command(&settings, AgentKind::Codex.adapter().command()));
+        // Every tool call reaches akhook.
+        assert!(settings.pointer("/hooks/PreToolUse/1/matcher").is_none());
+        // Other hooks keep their matchers.
+        assert_eq!(
+            settings.pointer("/hooks/PreToolUse/0/matcher").unwrap(),
+            "Other"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn widens_a_registration_limited_by_a_matcher() {
+        let path =
+            std::env::temp_dir().join(format!("akhook-init-old-{}.json", std::process::id()));
+        let command = AgentKind::Claude.adapter().command();
+        fs::write(
+            &path,
+            json!({"hooks": {"PreToolUse": [
+                {"matcher": "^(Bash|Edit|Write)$", "hooks": [{"type": "command", "command": command}]}
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        install(&path, AgentKind::Claude.adapter()).unwrap();
+        let settings = read_settings(&path).unwrap();
+        let groups = settings
+            .pointer("/hooks/PreToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].get("matcher").is_none());
         fs::remove_file(path).unwrap();
     }
 }
