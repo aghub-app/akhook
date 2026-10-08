@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    config::{CheckSpec, LoadedConfig, RuleEvent},
+    config::{ArgvItem, CheckSpec, CommandSpec, LoadedConfig, RuleAction, RuleEvent},
     model::{Candidate, Decision, FileAction, RuleHit, ToolAttempt},
+    shell,
 };
 
 #[derive(Debug, Error)]
@@ -35,23 +36,34 @@ struct Rule {
     actions: Vec<FileAction>,
     checks: Vec<Check>,
     message: String,
+    outcome: Outcome,
+}
+
+/// How a matched rule decides: a fixed action, or a `decide` script.
+enum Outcome {
+    Fixed(RuleAction),
+    Script(Script),
+}
+
+struct Script {
+    argv: Vec<String>,
+    timeout: Duration,
 }
 
 enum Check {
     Regex(Regex),
+    Argv(Vec<ArgvItem>),
     Ast {
         language: Option<SupportLang>,
         pattern: String,
     },
-    Command {
-        argv: Vec<String>,
-        timeout: Duration,
-    },
+    Command(Script),
 }
 
 pub struct RuleSet {
     root: PathBuf,
     rules: Vec<Rule>,
+    pub ask_instruction: Option<String>,
 }
 
 impl RuleSet {
@@ -109,22 +121,27 @@ impl RuleSet {
                                 pattern: ast.pattern,
                             })
                         }
-                        CheckSpec::Command { command } => {
-                            if command.argv.is_empty()
-                                || command.argv[0].is_empty()
-                                || command.timeout_ms == 0
-                            {
-                                return Err(invalid(
-                                    "command requires argv and a positive timeout_ms".into(),
-                                ));
+                        CheckSpec::Argv { argv } => {
+                            if spec.on != RuleEvent::ShellExec {
+                                return Err(invalid("argv requires shell_exec".into()));
                             }
-                            Ok(Check::Command {
-                                argv: command.argv,
-                                timeout: Duration::from_millis(command.timeout_ms),
-                            })
+                            if argv.is_empty() {
+                                return Err(invalid("argv cannot be empty".into()));
+                            }
+                            Ok(Check::Argv(argv))
+                        }
+                        CheckSpec::Command { command } => {
+                            script(command).map(Check::Command).map_err(invalid)
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let outcome = match (spec.action, spec.decide) {
+                    (Some(_), Some(_)) => {
+                        return Err(invalid("action and decide cannot both be set".into()));
+                    }
+                    (_, Some(decide)) => Outcome::Script(script(decide).map_err(invalid)?),
+                    (action, None) => Outcome::Fixed(action.unwrap_or(RuleAction::Deny)),
+                };
                 Ok(Rule {
                     id,
                     event: spec.on,
@@ -132,12 +149,14 @@ impl RuleSet {
                     actions: spec.actions,
                     checks,
                     message: spec.message,
+                    outcome,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             root: config.root,
             rules,
+            ask_instruction: config.ask_instruction,
         })
     }
 
@@ -149,22 +168,33 @@ impl RuleSet {
                 if !rule.applies(candidate, &self.root) {
                     continue;
                 }
-                if let Some(message) = rule.check(candidate, &self.root)? {
-                    if seen.insert(rule.id.clone()) {
-                        hits.push(RuleHit {
-                            id: rule.id.clone(),
-                            message,
-                        });
+                let Some(message) = rule.check(candidate, &self.root)? else {
+                    continue;
+                };
+                let (action, message) = match &rule.outcome {
+                    Outcome::Fixed(action) => (*action, message),
+                    Outcome::Script(script) => {
+                        let decided: DecideOutput =
+                            run_script(&rule.id, script, candidate, &self.root)?;
+                        let action = match decided.action {
+                            DecidedAction::Allow => continue,
+                            DecidedAction::Deny => RuleAction::Deny,
+                            DecidedAction::Ask => RuleAction::Ask,
+                        };
+                        (action, decided.message.unwrap_or(message))
                     }
-                    break;
+                };
+                if seen.insert(rule.id.clone()) {
+                    hits.push(RuleHit {
+                        id: rule.id.clone(),
+                        message,
+                        action,
+                    });
                 }
+                break;
             }
         }
-        Ok(if hits.is_empty() {
-            Decision::Allow
-        } else {
-            Decision::Deny(hits)
-        })
+        Ok(Decision::from_hits(hits))
     }
 }
 
@@ -187,6 +217,12 @@ impl Rule {
             let matched = match (check, candidate) {
                 (Check::Regex(pattern), Candidate::ShellExec { command }) => {
                     pattern.is_match(command).then_some(None)
+                }
+                (Check::Argv(pattern), Candidate::ShellExec { command }) => {
+                    shell::simple_commands(command)
+                        .iter()
+                        .any(|words| shell::argv_matches(pattern, words))
+                        .then_some(None)
                 }
                 (
                     Check::Regex(pattern),
@@ -220,8 +256,9 @@ impl Rule {
                         .is_some()
                         .then_some(None)
                 }
-                (Check::Command { argv, timeout }, candidate) => {
-                    run_checker(&self.id, argv, *timeout, candidate, root)?
+                (Check::Command(script), candidate) => {
+                    let answer: CheckerOutput = run_script(&self.id, script, candidate, root)?;
+                    answer.matched.then_some(answer.message)
                 }
                 _ => None,
             };
@@ -263,13 +300,41 @@ struct CheckerOutput {
     message: Option<String>,
 }
 
-fn run_checker(
+fn script(spec: CommandSpec) -> Result<Script, String> {
+    if spec.argv.is_empty() || spec.argv[0].is_empty() || spec.timeout_ms == 0 {
+        return Err("command requires argv and a positive timeout_ms".into());
+    }
+    Ok(Script {
+        argv: spec.argv,
+        timeout: Duration::from_millis(spec.timeout_ms),
+    })
+}
+
+/// Output of a `decide` script.
+#[derive(Deserialize)]
+struct DecideOutput {
+    action: DecidedAction,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DecidedAction {
+    Allow,
+    Deny,
+    Ask,
+}
+
+/// Runs a checker or decide script with the candidate on stdin and parses
+/// its stdout as `T`.
+fn run_script<T: serde::de::DeserializeOwned>(
     id: &str,
-    argv: &[String],
-    timeout: Duration,
+    script: &Script,
     candidate: &Candidate,
     root: &Path,
-) -> Result<Option<Option<String>>, RuleError> {
+) -> Result<T, RuleError> {
+    let Script { argv, timeout } = script;
+    let timeout = *timeout;
     let error = |reason: String| RuleError::Checker {
         id: id.into(),
         reason,
@@ -325,9 +390,7 @@ fn run_checker(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let answer: CheckerOutput = serde_json::from_slice(&output.stdout)
-        .map_err(|e| error(format!("invalid JSON output: {e}")))?;
-    Ok(answer.matched.then_some(answer.message))
+    serde_json::from_slice(&output.stdout).map_err(|e| error(format!("invalid JSON output: {e}")))
 }
 
 #[cfg(test)]
@@ -341,6 +404,7 @@ mod tests {
         let rules = RuleSet::new(LoadedConfig {
             root: root.clone(),
             rules: preset::omp_rules().unwrap(),
+            ask_instruction: None,
         })
         .unwrap();
         let attempt = |path: &str, text: &str| ToolAttempt {

@@ -42,6 +42,12 @@ impl Agent for Codex {
     fn deny_json(&self, reason: &str) -> Value {
         deny(reason)
     }
+
+    // Codex parses `ask` but runs the tool anyway, so asks go through
+    // one-time approvals instead.
+    fn ask_json(&self, _reason: &str) -> Option<Value> {
+        None
+    }
 }
 
 fn parse_patch(command: &str, cwd: &Path) -> Result<Vec<Candidate>> {
