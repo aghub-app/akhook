@@ -205,3 +205,63 @@ rules:
             .success()
     );
 }
+
+#[test]
+fn decide_scripts_choose_the_action() {
+    let env = Env::new("");
+    let script = env.write(
+        "decide.sh",
+        "#!/bin/sh\ncase \"$(cat)\" in\n  *main*) echo '{\"action\":\"ask\",\"message\":\"main is protected\"}' ;;\n  *nuke*) echo '{\"action\":\"deny\"}' ;;\n  *) echo '{\"action\":\"allow\"}' ;;\nesac\n",
+    );
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&script)
+        .status()
+        .unwrap();
+    env.write(
+        ".akhook.yml",
+        &format!(
+            "version: 1
+rules:
+  - id: push
+    on: shell_exec
+    checks:
+      - argv: [git, push]
+    decide:
+      argv: [{}]
+    message: push blocked
+",
+            script.display()
+        ),
+    );
+    assert!(
+        env.bash("claude", "git push origin feature", &[], &[])
+            .is_none()
+    );
+    assert_eq!(
+        env.bash("claude", "git push origin main", &[], &[])
+            .unwrap(),
+        ("ask".into(), "akhook [push]: main is protected".into())
+    );
+    assert_eq!(
+        env.bash("claude", "git push nuke", &[], &[]).unwrap(),
+        ("deny".into(), "akhook [push]: push blocked".into())
+    );
+
+    env.write(
+        ".akhook.yml",
+        "version: 1
+rules:
+  - id: both
+    on: shell_exec
+    action: ask
+    decide:
+      argv: [/bin/true]
+    checks:
+      - regex: x
+    message: m
+",
+    );
+    let (_, reason) = env.bash("codex", "x", &[], &[]).unwrap();
+    assert!(reason.contains("action and decide cannot both be set"));
+}

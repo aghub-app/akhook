@@ -122,6 +122,7 @@ pub fn omp_rules() -> Result<Vec<RuleSpec>> {
                 checks,
                 message: body.trim().to_string(),
                 action: None,
+                decide: None,
             })
         })
         .collect()

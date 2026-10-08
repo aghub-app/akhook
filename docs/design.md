@@ -25,7 +25,7 @@ akhook approval grant <id>          # 用户同意后放行该调用一次
 
 ### 附加配置
 
-附加配置来自 `AKHOOK_ADDITIONAL_CONFIG_PATH` 中的各路径，再加上各个 `--add-config-path`，按此顺序在用户级和项目配置**之后**合并。用户级和项目配置的 `disabled_rules` 与同 ID 规则都影响不到附加配置的规则；只有附加配置自己或更靠后的附加配置能关掉或覆盖它们。因此宿主（例如把 akhook 内置到 agent 镜像里的平台）可以用附加配置下发工作区里的 `.akhook.yml` 关不掉的规则。显式给出的附加配置不存在时视为配置错误。附加配置中 `command` 的相对程序路径仍按项目根目录解析，宜写绝对路径。
+附加配置来自 `AKHOOK_ADDITIONAL_CONFIG_PATH` 中的各路径，再加上各个 `--add-config-path`，按此顺序在用户级和项目配置**之后**合并。用户级和项目配置的 `disabled_rules` 与同 ID 规则都影响不到附加配置的规则；只有附加配置自己或更靠后的附加配置能关掉或覆盖它们。因此宿主（例如把 akhook 内置到 agent 镜像里的平台）可以用附加配置下发工作区里的 `.akhook.yml` 关不掉的规则。显式给出的附加配置不存在时视为配置错误。附加配置中 `command`/`decide` 的相对程序路径仍按项目根目录解析，宜写绝对路径。
 
 ## `.akhook.yml`
 
@@ -78,6 +78,15 @@ rules:
     checks:
       - argv: [git, push]
     message: 推送需要用户确认。
+
+  - id: push-protected
+    on: shell_exec
+    checks:
+      - argv: [git, push]
+    decide:
+      argv: [/opt/hooks/push-target]
+      timeout_ms: 5000
+    message: 不能推送到受保护分支。
 ```
 
 `on` 指规范化操作，不是 agent 的工具名。`paths` 和 `actions` 是文件规则的可选过滤器；`checks` 中任一条件命中即命中规则，多个规则命中则合并提示并拒绝整次工具调用。正则使用 Rust 正则语法。`ast` 使用内嵌 ast-grep 库，只检查文件变更新引入的内容；`language` 可省略并按路径推断。删除文件没有新增内容，因此正则和 AST 不对删除操作运行，外部检查器仍可检查其路径与动作。
@@ -90,10 +99,11 @@ rules:
 
 ### 动作
 
-规则命中后的动作由 `action` 决定；不填时为 `deny`。
+规则命中后的动作由 `action` 或 `decide` 决定，两者不能同时填写；都不填时为 `deny`。
 
 - `action: deny`：拒绝工具调用。
 - `action: ask`：请用户确认。Claude Code 直接返回 `permissionDecision: "ask"`。Codex 会解析 `ask` 但仍然执行工具，所以 akhook 改用一次性授权：见下文“用户确认”。
+- `decide`：与 `command` 检查相同的 `{argv, timeout_ms}`，在规则命中后对命中的候选操作运行一次。stdin 与外部检查器相同，stdout 返回 `{"action":"allow"|"deny"|"ask","message":"可选"}`。`allow` 表示这个候选不算命中；`message` 优先于规则的静态 `message`。脚本出错的处理与外部检查器相同。
 
 同一次工具调用中，只要有一条规则的动作为 `deny` 就拒绝，提示只包含拒绝的规则；否则若有 `ask` 就请用户确认。
 

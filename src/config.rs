@@ -45,9 +45,12 @@ pub struct RuleSpec {
     #[serde(default)]
     #[garde(skip)]
     pub action: Option<RuleAction>,
+    #[serde(default)]
+    #[garde(skip)]
+    pub decide: Option<CommandSpec>,
 }
 
-/// What a matched rule does. Without `action` it denies.
+/// What a matched rule does. Without `action` or `decide` it denies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleAction {
