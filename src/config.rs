@@ -89,6 +89,20 @@ pub struct LoadedConfig {
     pub rules: Vec<RuleSpec>,
 }
 
+/// Additional configs named by `AKHOOK_ADDITIONAL_CONFIG_PATH` (a path list)
+/// followed by `--add-config-path` flags; later ones take precedence.
+pub fn additional_config_paths(flags: Vec<PathBuf>) -> Vec<PathBuf> {
+    std::env::var_os(ADDITIONAL_CONFIG_ENV)
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| !path.as_os_str().is_empty())
+        .chain(flags)
+        .collect()
+}
+
+pub const ADDITIONAL_CONFIG_ENV: &str = "AKHOOK_ADDITIONAL_CONFIG_PATH";
+
 pub fn user_config_path() -> Result<PathBuf> {
     let dirs = BaseDirs::new().context("cannot locate user config directory")?;
     Ok(dirs.config_dir().join("akhook/akhook.yml"))
@@ -126,7 +140,11 @@ fn read_config(path: &Path) -> Result<Option<Config>> {
     Ok(Some(config))
 }
 
-pub fn load(cwd: &Path) -> Result<LoadedConfig> {
+/// Merges preset, user and project rules (`disabled_rules` applies to all of
+/// them), then each additional config in order. An additional config's rules
+/// cannot be disabled or replaced by the layers before it, only by itself or
+/// a later additional config.
+pub fn load(cwd: &Path, additional: &[PathBuf]) -> Result<LoadedConfig> {
     let project_path = project_config_path(cwd)?;
     let root = project_path
         .as_ref()
@@ -139,40 +157,58 @@ pub fn load(cwd: &Path) -> Result<LoadedConfig> {
         .map(read_config)
         .transpose()?
         .flatten();
-    let mut by_id = BTreeMap::new();
-    let mut disabled = Vec::new();
-    let use_omp = global
-        .as_ref()
-        .is_some_and(|c| c.presets.iter().any(|p| p == "omp"))
-        || project
-            .as_ref()
-            .is_some_and(|c| c.presets.iter().any(|p| p == "omp"));
-    for config in [global.as_ref(), project.as_ref()].into_iter().flatten() {
+    let additional = additional
+        .iter()
+        .map(|path| {
+            read_config(path)?
+                .with_context(|| format!("additional config {} not found", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let layers = [global.as_ref(), project.as_ref()]
+        .into_iter()
+        .flatten()
+        .chain(&additional);
+    let mut use_omp = false;
+    for config in layers {
         for name in &config.presets {
             if name != "omp" {
                 bail!("unknown preset {name}");
             }
+            use_omp = true;
         }
     }
+    let mut by_id = BTreeMap::new();
     if use_omp {
         for rule in preset::omp_rules()? {
             by_id.insert(rule.id.clone(), rule);
         }
     }
+    let mut disabled = Vec::new();
     for config in [global, project].into_iter().flatten() {
         disabled.extend(config.disabled_rules);
-        for rule in config.rules {
-            if rule.id.trim().is_empty() {
-                bail!("rule id cannot be empty");
-            }
-            by_id.insert(rule.id.clone(), rule);
-        }
+        insert_rules(&mut by_id, config.rules)?;
     }
     for id in disabled {
         by_id.remove(&id);
+    }
+    for config in additional {
+        for id in &config.disabled_rules {
+            by_id.remove(id);
+        }
+        insert_rules(&mut by_id, config.rules)?;
     }
     Ok(LoadedConfig {
         root,
         rules: by_id.into_values().collect(),
     })
+}
+
+fn insert_rules(by_id: &mut BTreeMap<String, RuleSpec>, rules: Vec<RuleSpec>) -> Result<()> {
+    for rule in rules {
+        if rule.id.trim().is_empty() {
+            bail!("rule id cannot be empty");
+        }
+        by_id.insert(rule.id.clone(), rule);
+    }
+    Ok(())
 }

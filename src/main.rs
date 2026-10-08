@@ -7,7 +7,7 @@ mod rules;
 
 use std::{
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +23,10 @@ use crate::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Extra config applied after the user and project configs; repeatable.
+    /// Also read from AKHOOK_ADDITIONAL_CONFIG_PATH (a path list).
+    #[arg(long = "add-config-path", global = true, value_name = "PATH")]
+    add_config_path: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -66,16 +70,17 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let additional = config::additional_config_paths(cli.add_config_path);
     match cli.command {
         Command::Init { global, agent } => {
             init::run(global, agent, Path::new(".").canonicalize()?.as_path())
         }
-        Command::Claude { command } => hook(AgentKind::Claude.adapter(), command),
-        Command::Codex { command } => hook(AgentKind::Codex.adapter(), command),
+        Command::Claude { command } => hook(AgentKind::Claude.adapter(), command, &additional),
+        Command::Codex { command } => hook(AgentKind::Codex.adapter(), command, &additional),
     }
 }
 
-fn hook(agent: &dyn Agent, command: AgentCommand) -> Result<()> {
+fn hook(agent: &dyn Agent, command: AgentCommand, additional: &[PathBuf]) -> Result<()> {
     let AgentCommand::Hook {
         action: HookAction::PreToolUse,
     } = command;
@@ -87,7 +92,7 @@ fn hook(agent: &dyn Agent, command: AgentCommand) -> Result<()> {
         let Some(attempt) = agent.decode(&input)? else {
             return Ok(None);
         };
-        let rules = RuleSet::new(config::load(&attempt.cwd)?)?;
+        let rules = RuleSet::new(config::load(&attempt.cwd, additional)?)?;
         Ok::<_, anyhow::Error>(agent.format_decision(rules.evaluate(&attempt)?))
     })();
     let response = match result {

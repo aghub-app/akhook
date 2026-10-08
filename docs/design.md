@@ -10,6 +10,8 @@ akhook init --global                # 创建用户配置，交互选择要全局
 akhook <agent> hook pre_tool_use    # 固定入口：从 stdin 读事件 JSON，向 stdout 写 agent 决策 JSON
 ```
 
+所有命令都接受可重复的 `--add-config-path <PATH>`，也读取环境变量 `AKHOOK_ADDITIONAL_CONFIG_PATH`（按系统路径列表分隔）；见下文“附加配置”。
+
 首版 `agent` 为 `claude` 或 `codex`。`init` 要求 `akhook` 已在 `PATH` 上，因为登记的命令直接使用这个名字。它在 agent 的现有设置中合并 akhook 登记，重复运行不重复添加，也不改动其他 hook：
 
 | agent | 项目登记 | 用户登记 | 固定命令 |
@@ -18,6 +20,10 @@ akhook <agent> hook pre_tool_use    # 固定入口：从 stdin 读事件 JSON，
 | Codex | `.codex/hooks.json` | `~/.codex/hooks.json` | `akhook codex hook pre_tool_use` |
 
 若选中的 agent 已全局登记，项目 `init` 只创建 `.akhook.yml`，避免同一次工具调用运行两遍。用户级规则配置位于操作系统标准配置目录下的 `akhook/akhook.yml`；CLI 显示实际路径。运行时从 hook 事件的 `cwd` 向上查找最近的 `.akhook.yml`，再与用户级配置合并。**全局 hook 登记**决定哪些项目调用 akhook；**全局规则**决定这些项目默认应用什么规则。
+
+### 附加配置
+
+附加配置来自 `AKHOOK_ADDITIONAL_CONFIG_PATH` 中的各路径，再加上各个 `--add-config-path`，按此顺序在用户级和项目配置**之后**合并。用户级和项目配置的 `disabled_rules` 与同 ID 规则都影响不到附加配置的规则；只有附加配置自己或更靠后的附加配置能关掉或覆盖它们。因此宿主（例如把 akhook 内置到 agent 镜像里的平台）可以用附加配置下发工作区里的 `.akhook.yml` 关不掉的规则。显式给出的附加配置不存在时视为配置错误。附加配置中 `command` 的相对程序路径仍按项目根目录解析，宜写绝对路径。
 
 ## `.akhook.yml`
 
