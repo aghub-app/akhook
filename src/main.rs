@@ -4,6 +4,7 @@ mod init;
 mod model;
 mod preset;
 mod rules;
+mod shell;
 
 use std::{
     io::{self, Read},

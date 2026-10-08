@@ -95,9 +95,21 @@ const GH_PR_CREATE: &str = "
   - id: gh-pr-create
     on: shell_exec
     checks:
-      - regex: 'gh pr create'
+      - argv: [gh, pr, create]
     message: use the PR tool
 ";
+
+#[test]
+fn argv_checks_parsed_shell_commands() {
+    let env = Env::new(&format!("version: 1\nrules:{GH_PR_CREATE}"));
+    let (decision, reason) = env
+        .bash("codex", "cd x && gh -R a/b pr 'create' --fill", &[], &[])
+        .unwrap();
+    assert_eq!(decision, "deny");
+    assert!(reason.contains("akhook [gh-pr-create]: use the PR tool"));
+    assert!(env.bash("codex", "gh pr view 1", &[], &[]).is_none());
+    assert!(env.bash("codex", "echo gh pr create", &[], &[]).is_none());
+}
 
 #[test]
 fn additional_configs_cannot_be_disabled_by_the_project() {

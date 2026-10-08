@@ -62,7 +62,25 @@ pub enum RuleEvent {
 pub enum CheckSpec {
     Regex { regex: String },
     Ast { ast: AstSpec },
+    Argv { argv: Vec<ArgvItem> },
     Command { command: CommandSpec },
+}
+
+/// One position of an `argv` check: a word, or any of several words.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ArgvItem {
+    One(String),
+    Any(Vec<String>),
+}
+
+impl ArgvItem {
+    pub fn matches(&self, word: &str) -> bool {
+        match self {
+            Self::One(expected) => expected == word,
+            Self::Any(choices) => choices.iter().any(|choice| choice == word),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

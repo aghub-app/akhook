@@ -57,9 +57,23 @@ rules:
     checks:
       - regex: 'rm\s+-rf\b'
     message: 请先确认删除范围。
+
+  - id: gh-pr-create
+    on: shell_exec
+    checks:
+      - argv: [gh, pr, create]
+    message: 请改用 PR 工具。
+
+  - id: gh-write
+    on: shell_exec
+    checks:
+      - argv: [gh, [pr, issue], [merge, close, comment]]
+    message: gh 只能用于读取。
 ```
 
 `on` 指规范化操作，不是 agent 的工具名。`paths` 和 `actions` 是文件规则的可选过滤器；`checks` 中任一条件命中即命中规则，多个规则命中则合并提示并拒绝整次工具调用。正则使用 Rust 正则语法。`ast` 使用内嵌 ast-grep 库，只检查文件变更新引入的内容；`language` 可省略并按路径推断。删除文件没有新增内容，因此正则和 AST 不对删除操作运行，外部检查器仍可检查其路径与动作。
+
+`argv` 只用于 `shell_exec`。命令先用 tree-sitter-bash 拆成简单命令：列表、管道、子 shell、命令替换里的命令，以及 `sh`/`bash`/`zsh`/`dash`/`ksh -c` 的脚本参数都会展开；每个简单命令去掉前置的变量赋值和重定向，参数去掉引号与转义。`argv` 的第一项与程序名的 basename 比较，其余各项须按顺序出现在参数中，可以不相邻，因此 `gh -R a/b pr create` 也匹配 `[gh, pr, create]`。每一项可以是一个词，也可以是备选词列表。`echo gh pr create` 中的 `gh` 只是参数，不会匹配。
 
 `omp` preset 默认关闭，由 `presets: [omp]` 显式启用。preset 规则 ID 使用 `omp/<原规则名>`；同 ID 的项目规则覆盖用户级规则，用户级规则覆盖 preset。`disabled_rules` 在合并后关闭对应 ID 的规则。首版将 omp 规则的命中统一映射为**执行前拒绝**，而不是沿用其软提醒时机。
 
@@ -89,6 +103,7 @@ enum FileAction { Create, Modify, Delete }
 enum CheckSpec {
     Regex { pattern: String },
     Ast { language: Option<Language>, pattern: String },
+    Argv { argv: Vec<ArgvItem> },
     Command { argv: Vec<String>, timeout_ms: u64 },
 }
 enum Decision { Allow, Deny(Vec<RuleHit>) }

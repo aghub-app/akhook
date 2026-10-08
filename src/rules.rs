@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    config::{CheckSpec, LoadedConfig, RuleEvent},
+    config::{ArgvItem, CheckSpec, LoadedConfig, RuleEvent},
     model::{Candidate, Decision, FileAction, RuleHit, ToolAttempt},
+    shell,
 };
 
 #[derive(Debug, Error)]
@@ -39,6 +40,7 @@ struct Rule {
 
 enum Check {
     Regex(Regex),
+    Argv(Vec<ArgvItem>),
     Ast {
         language: Option<SupportLang>,
         pattern: String,
@@ -108,6 +110,15 @@ impl RuleSet {
                                 language,
                                 pattern: ast.pattern,
                             })
+                        }
+                        CheckSpec::Argv { argv } => {
+                            if spec.on != RuleEvent::ShellExec {
+                                return Err(invalid("argv requires shell_exec".into()));
+                            }
+                            if argv.is_empty() {
+                                return Err(invalid("argv cannot be empty".into()));
+                            }
+                            Ok(Check::Argv(argv))
                         }
                         CheckSpec::Command { command } => {
                             if command.argv.is_empty()
@@ -187,6 +198,12 @@ impl Rule {
             let matched = match (check, candidate) {
                 (Check::Regex(pattern), Candidate::ShellExec { command }) => {
                     pattern.is_match(command).then_some(None)
+                }
+                (Check::Argv(pattern), Candidate::ShellExec { command }) => {
+                    shell::simple_commands(command)
+                        .iter()
+                        .any(|words| shell::argv_matches(pattern, words))
+                        .then_some(None)
                 }
                 (
                     Check::Regex(pattern),

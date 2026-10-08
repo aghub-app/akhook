@@ -9,4 +9,4 @@ akhook init                     # 选择项目中使用的 agent
 akhook init --global            # 或在用户设置中安装全局 hook
 ```
 
-在 `.akhook.yml` 中添加规则；`presets: [omp]` 可启用随包提供的 omp 规则。首版使用 `PreToolUse` 在工具执行前检查文件变更和 shell 命令。平台可以用 `--add-config-path` 或 `AKHOOK_ADDITIONAL_CONFIG_PATH` 下发项目配置关不掉的规则。可从 [regex、shell 和 AST 示例](examples/README.md)开始；完整配置格式与代码架构见[设计文档](docs/design.md)。
+在 `.akhook.yml` 中添加规则；`presets: [omp]` 可启用随包提供的 omp 规则。首版使用 `PreToolUse` 在工具执行前检查文件变更和 shell 命令。shell 规则可以按解析后的命令参数匹配（`argv`）。平台可以用 `--add-config-path` 或 `AKHOOK_ADDITIONAL_CONFIG_PATH` 下发项目配置关不掉的规则。可从 [regex、shell 和 AST 示例](examples/README.md)开始；完整配置格式与代码架构见[设计文档](docs/design.md)。
