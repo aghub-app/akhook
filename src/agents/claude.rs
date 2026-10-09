@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{Agent, attempt, cwd, decision, deny, event, field, resolve, settings_path};
+use super::{Agent, attempt, cwd, decision, deny, event, field, resolve, settings_path, tool_call};
 use crate::model::{Candidate, FileAction, ToolAttempt};
 
 pub struct Claude;
 
 impl Agent for Claude {
-    fn command(&self) -> &'static str {
-        "akhook claude hook pre_tool_use"
+    fn name(&self) -> &'static str {
+        "claude"
     }
 
     fn settings_file(&self, global: bool, root: &Path) -> Result<PathBuf> {
@@ -20,10 +20,11 @@ impl Agent for Claude {
     fn decode(&self, input: &str) -> Result<Option<ToolAttempt>> {
         let value = event(input)?;
         let tool = field(&value, "tool_name")?;
-        if !matches!(tool, "Bash" | "Edit" | "Write") {
-            return Ok(None);
-        }
         let cwd = cwd(&value)?;
+        let call = tool_call(&value)?;
+        if !matches!(tool, "Bash" | "Edit" | "Write") {
+            return Ok(Some(attempt(&value, cwd, vec![call])));
+        }
         let payload = value.get("tool_input").context("missing tool_input")?;
         let candidate = match tool {
             "Bash" => Candidate::ShellExec {
@@ -49,7 +50,7 @@ impl Agent for Claude {
             }
             _ => unreachable!(),
         };
-        Ok(Some(attempt(&value, cwd, vec![candidate])))
+        Ok(Some(attempt(&value, cwd, vec![candidate, call])))
     }
 
     fn deny_json(&self, reason: &str) -> Value {

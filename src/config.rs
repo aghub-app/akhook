@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
 use garde::Validate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{model::FileAction, preset};
 
@@ -23,6 +23,10 @@ pub struct Config {
     pub rules: Vec<RuleSpec>,
     #[serde(default)]
     pub ask_instruction: Option<String>,
+    /// Tools that run shell commands, by name, with the argument that holds
+    /// the command: their calls are `shell_exec` candidates too.
+    #[serde(default)]
+    pub shell_tools: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -38,16 +42,26 @@ pub struct RuleSpec {
     #[serde(default)]
     #[garde(skip)]
     pub actions: Vec<FileAction>,
-    #[garde(length(min = 1))]
+    /// Tool names (globs) a `tool_call` rule is limited to.
+    #[serde(default)]
+    #[garde(skip)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    #[garde(skip)]
     pub checks: Vec<CheckSpec>,
-    #[garde(custom(non_blank))]
-    pub message: String,
+    #[serde(default)]
+    #[garde(inner(custom(non_blank)))]
+    pub message: Option<String>,
     #[serde(default)]
     #[garde(skip)]
     pub action: Option<RuleAction>,
     #[serde(default)]
     #[garde(skip)]
     pub decide: Option<CommandSpec>,
+    /// What a lifecycle rule (`prompt_submit`, `stop`) runs.
+    #[serde(default)]
+    #[garde(skip)]
+    pub run: Option<CommandSpec>,
 }
 
 /// What a matched rule does. Without `action` or `decide` it denies.
@@ -66,11 +80,23 @@ fn non_blank(value: &str, _: &()) -> garde::Result {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleEvent {
     FileChange,
     ShellExec,
+    ToolCall,
+    /// The user submitted a prompt: the rule's command may add context.
+    PromptSubmit,
+    /// The agent finished its turn.
+    Stop,
+}
+
+impl RuleEvent {
+    /// Lifecycle rules run a command; the others check tool calls.
+    pub fn is_lifecycle(self) -> bool {
+        matches!(self, Self::PromptSubmit | Self::Stop)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +148,7 @@ pub struct LoadedConfig {
     pub root: PathBuf,
     pub rules: Vec<RuleSpec>,
     pub ask_instruction: Option<String>,
+    pub shell_tools: BTreeMap<String, String>,
 }
 
 /// Additional configs named by `AKHOOK_ADDITIONAL_CONFIG_PATH` (a path list)
@@ -205,7 +232,9 @@ pub fn load(cwd: &Path, additional: &[PathBuf]) -> Result<LoadedConfig> {
         .chain(&additional);
     let mut use_omp = false;
     let mut ask_instruction = None;
+    let mut shell_tools = BTreeMap::new();
     for config in layers {
+        shell_tools.extend(config.shell_tools.clone());
         for name in &config.presets {
             if name != "omp" {
                 bail!("unknown preset {name}");
@@ -240,6 +269,7 @@ pub fn load(cwd: &Path, additional: &[PathBuf]) -> Result<LoadedConfig> {
         root,
         rules: by_id.into_values().collect(),
         ask_instruction,
+        shell_tools,
     })
 }
 

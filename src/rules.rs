@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -34,15 +34,18 @@ struct Rule {
     event: RuleEvent,
     paths: Vec<GlobMatcher>,
     actions: Vec<FileAction>,
+    tools: Vec<GlobMatcher>,
     checks: Vec<Check>,
     message: String,
     outcome: Outcome,
 }
 
-/// How a matched rule decides: a fixed action, or a `decide` script.
+/// How a matched rule decides: a fixed action, or a `decide` script. A
+/// lifecycle rule runs its `run` command instead.
 enum Outcome {
     Fixed(RuleAction),
     Script(Script),
+    Run(Script),
 }
 
 struct Script {
@@ -63,7 +66,27 @@ enum Check {
 pub struct RuleSet {
     root: PathBuf,
     rules: Vec<Rule>,
+    shell_tools: BTreeMap<String, String>,
     pub ask_instruction: Option<String>,
+}
+
+/// What a lifecycle rule's command gets, besides the rule and the event:
+/// the fields the agent reported, each when it did.
+#[derive(Debug, Default, Serialize)]
+pub struct LifecycleEvent {
+    pub cwd: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// prompt_submit: the user's prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// stop: the agent's last message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
 }
 
 impl RuleSet {
@@ -81,20 +104,60 @@ impl RuleSet {
                     id: id.clone(),
                     reason,
                 };
-                if spec.on == RuleEvent::ShellExec
+                if spec.on.is_lifecycle() {
+                    if !spec.checks.is_empty()
+                        || !spec.paths.is_empty()
+                        || !spec.actions.is_empty()
+                        || !spec.tools.is_empty()
+                        || spec.message.is_some()
+                        || spec.action.is_some()
+                        || spec.decide.is_some()
+                    {
+                        return Err(invalid("prompt_submit and stop rules only take run".into()));
+                    }
+                    let run = spec
+                        .run
+                        .ok_or_else(|| invalid("prompt_submit and stop rules need run".into()))?;
+                    return Ok(Rule {
+                        id: id.clone(),
+                        event: spec.on,
+                        paths: Vec::new(),
+                        actions: Vec::new(),
+                        tools: Vec::new(),
+                        checks: Vec::new(),
+                        message: String::new(),
+                        outcome: Outcome::Run(script(run).map_err(invalid)?),
+                    });
+                }
+                if spec.run.is_some() {
+                    return Err(invalid("run is for prompt_submit and stop rules".into()));
+                }
+                if spec.checks.is_empty() {
+                    return Err(invalid("checks cannot be empty".into()));
+                }
+                let message = spec
+                    .message
+                    .ok_or_else(|| invalid("message is required".into()))?;
+                if spec.on != RuleEvent::FileChange
                     && (!spec.paths.is_empty() || !spec.actions.is_empty())
                 {
-                    return Err(invalid("shell_exec cannot use paths or actions".into()));
+                    return Err(invalid("paths and actions require file_change".into()));
                 }
-                let paths = spec
-                    .paths
-                    .into_iter()
-                    .map(|glob| {
-                        Glob::new(&glob)
-                            .map(|g| g.compile_matcher())
-                            .map_err(|e| invalid(format!("invalid path glob {glob}: {e}")))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                if spec.on != RuleEvent::ToolCall && !spec.tools.is_empty() {
+                    return Err(invalid("tools requires tool_call".into()));
+                }
+                let globs = |globs: Vec<String>, what: &str| {
+                    globs
+                        .into_iter()
+                        .map(|glob| {
+                            Glob::new(&glob)
+                                .map(|g| g.compile_matcher())
+                                .map_err(|e| invalid(format!("invalid {what} glob {glob}: {e}")))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let paths = globs(spec.paths, "path")?;
+                let tools = globs(spec.tools, "tool")?;
                 let checks = spec
                     .checks
                     .into_iter()
@@ -147,8 +210,9 @@ impl RuleSet {
                     event: spec.on,
                     paths,
                     actions: spec.actions,
+                    tools,
                     checks,
-                    message: spec.message,
+                    message,
                     outcome,
                 })
             })
@@ -156,15 +220,37 @@ impl RuleSet {
         Ok(Self {
             root: config.root,
             rules,
+            shell_tools: config.shell_tools,
             ask_instruction: config.ask_instruction,
         })
+    }
+
+    /// The attempt's candidates, plus a `shell_exec` for each call of a tool
+    /// the config names in `shell_tools`.
+    fn candidates(&self, attempt: &ToolAttempt) -> Vec<Candidate> {
+        let mut candidates = attempt.candidates.clone();
+        for candidate in &attempt.candidates {
+            if let Candidate::ToolCall { name, args } = candidate
+                && let Some(command) = self
+                    .shell_tools
+                    .get(name)
+                    .and_then(|field| args.get(field))
+                    .and_then(serde_json::Value::as_str)
+            {
+                candidates.push(Candidate::ShellExec {
+                    command: command.into(),
+                });
+            }
+        }
+        candidates
     }
 
     pub fn evaluate(&self, attempt: &ToolAttempt) -> Result<Decision, RuleError> {
         let mut hits = Vec::new();
         let mut seen = BTreeSet::new();
+        let candidates = self.candidates(attempt);
         for rule in &self.rules {
-            for candidate in &attempt.candidates {
+            for candidate in &candidates {
                 if !rule.applies(candidate, &self.root) {
                     continue;
                 }
@@ -173,6 +259,7 @@ impl RuleSet {
                 };
                 let (action, message) = match &rule.outcome {
                     Outcome::Fixed(action) => (*action, message),
+                    Outcome::Run(_) => continue,
                     Outcome::Script(script) => {
                         let decided: DecideOutput =
                             run_script(&rule.id, script, candidate, &self.root)?;
@@ -196,12 +283,65 @@ impl RuleSet {
         }
         Ok(Decision::from_hits(hits))
     }
+
+    /// Runs the event's lifecycle rules, in order, and returns the context
+    /// they add. A failing command never holds up the agent: it is reported
+    /// on stderr and adds nothing.
+    pub fn lifecycle(&self, event: RuleEvent, data: &LifecycleEvent) -> Vec<String> {
+        let mut contexts = Vec::new();
+        for rule in self.rules.iter().filter(|rule| rule.event == event) {
+            let Outcome::Run(script) = &rule.outcome else {
+                continue;
+            };
+            let input = LifecycleInput {
+                version: 1,
+                rule_id: &rule.id,
+                event,
+                data,
+            };
+            let output = serde_json::to_vec(&input)
+                .map_err(|e| RuleError::Checker {
+                    id: rule.id.clone(),
+                    reason: e.to_string(),
+                })
+                .and_then(|input| run_command(&rule.id, script, input, &self.root));
+            match output {
+                Ok(stdout) if stdout.iter().all(u8::is_ascii_whitespace) => {}
+                Ok(stdout) => match serde_json::from_slice::<LifecycleOutput>(&stdout) {
+                    Ok(LifecycleOutput {
+                        context: Some(context),
+                    }) if !context.trim().is_empty() => contexts.push(context),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("akhook: {}: invalid JSON output: {e}", rule.id),
+                },
+                Err(error) => eprintln!("akhook: {error}"),
+            }
+        }
+        contexts
+    }
+}
+
+#[derive(Serialize)]
+struct LifecycleInput<'a> {
+    version: u8,
+    rule_id: &'a str,
+    event: RuleEvent,
+    #[serde(flatten)]
+    data: &'a LifecycleEvent,
+}
+
+#[derive(Deserialize)]
+struct LifecycleOutput {
+    context: Option<String>,
 }
 
 impl Rule {
     fn applies(&self, candidate: &Candidate, root: &Path) -> bool {
         match (self.event, candidate) {
             (RuleEvent::ShellExec, Candidate::ShellExec { .. }) => true,
+            (RuleEvent::ToolCall, Candidate::ToolCall { name, .. }) => {
+                self.tools.is_empty() || self.tools.iter().any(|glob| glob.is_match(name))
+            }
             (RuleEvent::FileChange, Candidate::FileChange { path, action, .. }) => {
                 let relative = path.strip_prefix(root).unwrap_or(path);
                 let path = relative.to_string_lossy().replace('\\', "/");
@@ -217,6 +357,9 @@ impl Rule {
             let matched = match (check, candidate) {
                 (Check::Regex(pattern), Candidate::ShellExec { command }) => {
                     pattern.is_match(command).then_some(None)
+                }
+                (Check::Regex(pattern), Candidate::ToolCall { args, .. }) => {
+                    pattern.is_match(&args.to_string()).then_some(None)
                 }
                 (Check::Argv(pattern), Candidate::ShellExec { command }) => {
                     shell::simple_commands(command)
@@ -333,6 +476,32 @@ fn run_script<T: serde::de::DeserializeOwned>(
     candidate: &Candidate,
     root: &Path,
 ) -> Result<T, RuleError> {
+    let error = |reason: String| RuleError::Checker {
+        id: id.into(),
+        reason,
+    };
+    let mut normalized = candidate.clone();
+    if let Candidate::FileChange { path, .. } = &mut normalized {
+        *path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    }
+    let input = serde_json::to_vec(&CheckerInput {
+        version: 1,
+        rule_id: id,
+        candidate: &normalized,
+    })
+    .map_err(|e| error(e.to_string()))?;
+    let stdout = run_command(id, script, input, root)?;
+    serde_json::from_slice(&stdout).map_err(|e| error(format!("invalid JSON output: {e}")))
+}
+
+/// Runs a rule's command from the project root with input on stdin and
+/// returns its stdout; a timeout or a failed exit is an error.
+fn run_command(
+    id: &str,
+    script: &Script,
+    input: Vec<u8>,
+    root: &Path,
+) -> Result<Vec<u8>, RuleError> {
     let Script { argv, timeout } = script;
     let timeout = *timeout;
     let error = |reason: String| RuleError::Checker {
@@ -353,16 +522,6 @@ fn run_script<T: serde::de::DeserializeOwned>(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| error(e.to_string()))?;
-    let mut normalized = candidate.clone();
-    if let Candidate::FileChange { path, .. } = &mut normalized {
-        *path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-    }
-    let input = serde_json::to_vec(&CheckerInput {
-        version: 1,
-        rule_id: id,
-        candidate: &normalized,
-    })
-    .map_err(|e| error(e.to_string()))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let writer = thread::spawn(move || stdin.write_all(&input));
     let started = Instant::now();
@@ -378,10 +537,16 @@ fn run_script<T: serde::de::DeserializeOwned>(
             None => thread::sleep(Duration::from_millis(10)),
         }
     }
-    writer
+    // A command may exit without reading its input.
+    match writer
         .join()
         .map_err(|_| error("stdin writer panicked".into()))?
-        .map_err(|e| error(format!("writing stdin: {e}")))?;
+    {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            return Err(error(format!("writing stdin: {e}")));
+        }
+        _ => {}
+    }
     let output = child.wait_with_output().map_err(|e| error(e.to_string()))?;
     if !output.status.success() {
         return Err(error(format!(
@@ -390,7 +555,7 @@ fn run_script<T: serde::de::DeserializeOwned>(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    serde_json::from_slice(&output.stdout).map_err(|e| error(format!("invalid JSON output: {e}")))
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -405,6 +570,7 @@ mod tests {
             root: root.clone(),
             rules: preset::omp_rules().unwrap(),
             ask_instruction: None,
+            shell_tools: BTreeMap::new(),
         })
         .unwrap();
         let attempt = |path: &str, text: &str| ToolAttempt {

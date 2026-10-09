@@ -1,25 +1,28 @@
 # akhook 架构与接口
 
-akhook 是一个 Rust CLI：项目在根目录用 `.akhook.yml` 定义规则，由 Claude Code、Codex 等 agent 的 hook 调用同一个规则引擎。首版在工具执行前检查完整调用；命中时拒绝调用，并把规则提示交给 agent。原始 TTSR 的生成中断与重试需要控制模型循环，现有 agent hooks 无法提供；见 [TTSR 参考](ttsr.md) 和 [hook 能力](agent-hooks.md)。
+akhook 是一个 Rust CLI：项目在根目录用 `.akhook.yml` 定义规则，由 Claude Code、Codex 和 ADK agent 的 hook 调用同一个规则引擎。它在工具执行前检查完整调用，命中时拒绝调用，并把规则提示交给 agent；也在用户提交 prompt 和 agent 结束一轮时运行规则里的命令（生命周期规则），由命令给这一轮补充上下文。原始 TTSR 的生成中断与重试需要控制模型循环，现有 agent hooks 无法提供；见 [TTSR 参考](ttsr.md) 和 [hook 能力](agent-hooks.md)。
 
 ## CLI 与配置位置
 
 ```text
 akhook init                         # 创建项目配置，交互选择要安装 hook 的 agent
 akhook init --global                # 创建用户配置，交互选择要全局安装 hook 的 agent
-akhook <agent> hook pre_tool_use    # 固定入口：从 stdin 读事件 JSON，向 stdout 写 agent 决策 JSON
+akhook <agent> hook pre_tool_use    # 工具调用前：从 stdin 读事件 JSON，向 stdout 写 agent 决策 JSON
+akhook <agent> hook prompt_submit   # 用户提交 prompt：运行 prompt_submit 规则，输出这一轮的上下文
+akhook <agent> hook stop            # agent 结束一轮：运行 stop 规则
 akhook approval show <id>           # 查看一条待确认请求（JSON）
 akhook approval grant <id>          # 用户同意后放行该调用一次
 ```
 
 所有命令都接受可重复的 `--add-config-path <PATH>`，也读取环境变量 `AKHOOK_ADDITIONAL_CONFIG_PATH`（按系统路径列表分隔）；见下文“附加配置”。
 
-首版 `agent` 为 `claude` 或 `codex`。`init` 要求 `akhook` 已在 `PATH` 上，因为登记的命令直接使用这个名字。它在 agent 的现有设置中合并 akhook 登记，重复运行不重复添加，也不改动其他 hook。登记不带 `matcher`，每次工具调用都交给 akhook，由 adapter 决定处理哪些工具、其余直接放行；这样 akhook 支持新的工具时不需要重新登记。早期版本登记时带的 matcher，重新运行 `init` 会去掉：
+`agent` 为 `claude`、`codex` 或 `adk`。`init` 要求 `akhook` 已在 `PATH` 上，因为登记的命令直接使用这个名字。它在 agent 的现有设置中合并 akhook 登记：`PreToolUse`、`UserPromptSubmit` 和 `Stop` 各一条（`akhook <agent> hook pre_tool_use|prompt_submit|stop`），重复运行不重复添加，也不改动其他 hook。没有生命周期规则时后两条什么也不做。工具调用的登记不带 `matcher`，每次工具调用都交给 akhook，由 adapter 决定怎么处理；这样 akhook 支持新的工具时不需要重新登记。早期版本登记时带的 matcher，重新运行 `init` 会去掉：
 
-| agent | 项目登记 | 用户登记 | 固定命令 |
-|---|---|---|---|
-| Claude Code | `.claude/settings.json` | `~/.claude/settings.json` | `akhook claude hook pre_tool_use` |
-| Codex | `.codex/hooks.json` | `~/.codex/hooks.json` | `akhook codex hook pre_tool_use` |
+| agent | 项目登记 | 用户登记 |
+|---|---|---|
+| Claude Code | `.claude/settings.json` | `~/.claude/settings.json` |
+| Codex | `.codex/hooks.json` | `~/.codex/hooks.json` |
+| ADK | 无：宿主在代码里注册回调，见下文 [ADK](#adk) | 无 |
 
 若选中的 agent 已全局登记，项目 `init` 只创建 `.akhook.yml`，避免同一次工具调用运行两遍。用户级规则配置位于操作系统标准配置目录下的 `akhook/akhook.yml`；CLI 显示实际路径。运行时从 hook 事件的 `cwd` 向上查找最近的 `.akhook.yml`，再与用户级配置合并。**全局 hook 登记**决定哪些项目调用 akhook；**全局规则**决定这些项目默认应用什么规则。
 
@@ -113,9 +116,57 @@ rules:
 
 请求 ID 由命中的规则 ID、`cwd` 和候选操作的哈希得到，因此只有完全相同的调用会对应同一个请求。`grant` 写入 `grants/<id>.json`，十分钟内有效；下一次相同调用删除它并放行，只放行一次。状态都是文件，每次 hook 进程按请求 ID 读写；写入先写临时文件再改名，放行以删除授权文件成功为准，两次相同调用并发时只有一次放行。`ask` 规则命中时顺带清理：过期的授权和超过一天无人处理的请求被删除；清理失败不影响本次决策。授权文件对 agent 自己可写，所以这是防止 agent 误操作的确认步骤，不是安全边界。
 
+### 工具调用规则
+
+每个工具调用都是一个 `tool_call` 候选（工具名和参数），无论 adapter 是否还从中解析出文件变更或 shell 命令；`on: tool_call` 的规则因此能管 MCP 工具和宿主自己的工具。`tools` 按工具名（glob）限定，`regex` 匹配参数的紧凑 JSON 文本，`command` 检查器收到 `{"type":"tool_call","name":...,"args":...}`；`argv`、`ast`、`paths`、`actions` 不适用。
+
+```yaml
+shell_tools:
+  run_shell: command        # 宿主的 shell 工具：参数 command 是要执行的命令
+rules:
+  - id: no-delete-prod
+    on: tool_call
+    tools: ["mcp__github__*"]
+    checks:
+      - regex: '"repo":"prod"'
+    message: 不要动生产仓库。
+```
+
+顶层 `shell_tools` 把宿主自己的 shell 工具（名称 → 存放命令的参数）也当成 `shell_exec`，现有的 `argv`、`regex` 规则照常生效。各层配置的 `shell_tools` 合并，后面的覆盖前面的。
+
+### 生命周期规则
+
+`on: prompt_submit`（用户提交 prompt）和 `on: stop`（agent 结束一轮）的规则不检查什么，只运行 `run` 里的命令（与 `command` 检查器相同的 `{argv, timeout_ms}`）；它们不能带 `checks`、`message`、`action`、`decide`、`paths`、`actions`、`tools`。同一事件的规则按 ID 顺序依次运行。命令的 stdin 是版本化 JSON，agent 报告了哪些字段就带哪些：
+
+```json
+{"version":1,"rule_id":"memory/recall","event":"prompt_submit","cwd":"/work","session_id":"...","turn_id":"...","prompt":"..."}
+{"version":1,"rule_id":"memory/capture","event":"stop","cwd":"/work","turn_id":"...","model":"...","last_assistant_message":"..."}
+```
+
+`prompt_submit` 的命令可以在 stdout 输出 `{"context":"..."}`，各条规则的上下文合起来作为这一轮的附加上下文（`UserPromptSubmit` 的 `additionalContext`）；没有输出就是不补充。`stop` 的输出被忽略。与工具规则相反，生命周期规则从不挡住 agent：命令出错、超时、输出无效或配置无效时，akhook 在 stderr 报告原因、什么都不输出，这一轮照常进行。
+
+插件可以随自己带一份配置，宿主把它加进 `AKHOOK_ADDITIONAL_CONFIG_PATH`：插件的 hook 就只声明一次，Claude Code、Codex 和 ADK 都能运行。
+
+## ADK
+
+[ADK](https://adk.dev)（Agent Development Kit）是库，没有 hook 配置，也没有自己的事件格式：宿主在代码里给 agent 注册回调。akhook 为它采用 Claude Code 的 hook 格式（Codex 也用这个格式），`akhook adk hook <action>` 的输入输出与 Claude Code 相同。ADK 的工具都是宿主的，所以每次调用只产生 `tool_call` 候选，shell 类工具由配置的 `shell_tools` 指明。回调里没有人可问，`ask` 规则与 Codex 一样走一次性授权。
+
+Go 宿主用 `go/adk`（模块 `github.com/aghub-app/akhook/go/adk`）：
+
+```go
+hooks := adk.New(workspace)          // agent 的工作目录，从这里找 .akhook.yml
+config := llmagent.Config{Name: "agent", Model: model, Tools: tools}
+hooks.Install(&config)               // 追加回调，不影响已有的
+agent, err := llmagent.New(config)
+```
+
+- 工具调用前（`BeforeToolCallback`）运行 `pre_tool_use`。被拒绝的调用不执行，模型收到的工具结果是 `{"error": 原因}`；akhook 无法运行时同样不执行。
+- 一次 invocation 开始时（`BeforeAgentCallback`）以用户消息运行 `prompt_submit`，`turn_id` 是 invocation ID；补充的上下文追加到这次 invocation 每个模型请求的 system instruction（`BeforeModelCallback`）。
+- 结束时（`AfterAgentCallback`）以最后一条模型回复运行 `stop`。
+
 ## Rust 规则接口
 
-运行路径为 `main.rs`（CLI）→ `agents/claude.rs` 或 `agents/codex.rs`（各自实现 `Agent` trait，负责 hook JSON 与文件变更解析）→ `config.rs`/`preset.rs`（规则来源与合并）→ `rules.rs`（匹配和外部检查）→ 对应 agent adapter（决策编码）。`agents/mod.rs` 只定义 trait 和共享的协议辅助函数；规范化的操作和决策类型放在 `model.rs`。agent adapter 不读取规则细节，规则引擎不解析 agent 的原始 JSON。
+运行路径为 `main.rs`（CLI）→ `agents/claude.rs`、`agents/codex.rs` 或 `agents/adk.rs`（各自实现 `Agent` trait，负责 hook JSON 与文件变更解析）→ `config.rs`/`preset.rs`（规则来源与合并）→ `rules.rs`（匹配和外部检查）→ 对应 agent adapter（决策编码）。`agents/mod.rs` 只定义 trait 和共享的协议辅助函数；规范化的操作和决策类型放在 `model.rs`。agent adapter 不读取规则细节，规则引擎不解析 agent 的原始 JSON。
 
 ```rust
 struct ToolAttempt {
@@ -131,6 +182,7 @@ enum Candidate {
         added_text: Option<String>, // 删除时为 None；空文件创建时为 Some("")
     },
     ShellExec { command: String },
+    ToolCall { name: String, args: serde_json::Value },
 }
 
 enum FileAction { Create, Modify, Delete }
@@ -160,6 +212,7 @@ Claude adapter 从 Edit/Write 的结构化参数提取文件变更；Codex adapt
 
 ## 错误与覆盖范围
 
-- 配置无效、已支持的工具输入无法解析、匹配规则所需的 AST 语言无法确定，或检查器出错时，adapter 返回带原因的拒绝结果；不能通过空输出或进程错误假装规则通过。未知工具不作决定。
+- 配置无效、已支持的工具输入无法解析、匹配规则所需的 AST 语言无法确定，或检查器出错时，adapter 返回带原因的拒绝结果；不能通过空输出或进程错误假装规则通过。没有 `tool_call` 规则时，其他工具直接放行。生命周期规则相反，出错时不挡住 agent（见上文）。
+- 检查器或命令不读 stdin 就退出时，不算出错。
 - Shell 规则只检查命令文本；`cat > file` 或脚本运行后的实际文件变化不能从任意命令中可靠推断。
 - `PreToolUse` 能阻止受支持工具的执行，不能撤回已生成文本，也不能覆盖未进入该 hook 路径的工具；完整能力边界见 [agent hooks](agent-hooks.md)。

@@ -119,10 +119,12 @@ pub fn omp_rules() -> Result<Vec<RuleSpec>> {
                 on: RuleEvent::FileChange,
                 paths: paths.into_iter().collect(),
                 actions: vec![FileAction::Create, FileAction::Modify],
+                tools: Vec::new(),
                 checks,
-                message: body.trim().to_string(),
+                message: Some(body.trim().to_string()),
                 action: None,
                 decide: None,
+                run: None,
             })
         })
         .collect()

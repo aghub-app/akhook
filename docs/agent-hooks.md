@@ -1,4 +1,4 @@
-# Claude Code 与 Codex Hooks
+# Claude Code、Codex 与 ADK Hooks
 
 本文记录 Claude Code 与 OpenAI Codex 的 hook 生命周期、工具调用拦截、流式输出能力，以及跨端规则引擎需要适配的差异。这里的“流式 hook”特指：模型生成中的文本或工具参数以增量片段进入规则引擎，并允许引擎中断本次生成、向模型注入规则后重试。它不等同于读取完整工具参数后、工具执行前进行匹配。
 
@@ -88,6 +88,10 @@ Hook 由事件、matcher group 和 handler 构成。Command hook 通过 stdin �
 ### 覆盖范围
 
 Codex 官方文档区分本地 function-tool hook 路径与 hosted tools。当前文档列举的本地覆盖包括 shell 命令、`apply_patch`、MCP 和其他本地 function tools，同时指出具体工具路径及例外需查看工具覆盖说明。跨端 adapter 不应把“Codex 支持 PreToolUse”理解为“所有工具都必定发出 hook”。[2]
+
+## ADK
+
+ADK（Agent Development Kit）是构建 agent 的库，没有 hook 配置文件，扩展点是宿主在代码里注册的回调：`BeforeAgentCallback` / `AfterAgentCallback`（一次 invocation 的开始和结束）、`BeforeModelCallback` / `AfterModelCallback`（每次模型请求前后，可以改写请求）、`BeforeToolCallback` / `AfterToolCallback`（工具执行前后；执行前的回调返回非空结果时跳过工具，以它作为工具结果）。工具都是宿主定义的（函数工具、MCP 工具），没有内置的 shell 或编辑工具。akhook 的 ADK 接入见[设计文档](design.md#adk)。
 
 ## “细粒度”与“流式”的区别
 
