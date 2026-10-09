@@ -22,6 +22,11 @@ pub enum Candidate {
     ShellExec {
         command: String,
     },
+    /// Any tool call, as the agent named it, with its arguments.
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

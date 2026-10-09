@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    agents::{Agent, AgentKind},
+    agents::{Agent, AgentKind, HOOKS, hook_command},
     config,
 };
 
@@ -41,13 +41,13 @@ pub fn run(global: bool, mut agents: Vec<AgentKind>, cwd: &Path) -> Result<()> {
         let settings = agent.settings_file(global, cwd)?;
         if !global && registered(&agent.settings_file(true, cwd)?, agent)? {
             println!(
-                "{}: global hook already registered; using project rules",
-                agent.command()
+                "{}: global hooks already registered; using project rules",
+                agent.name()
             );
             continue;
         }
         install(&settings, agent)?;
-        println!("{}: {}", agent.command(), settings.display());
+        println!("{}: {}", agent.name(), settings.display());
     }
     println!("rules: {}", config_path.display());
     Ok(())
@@ -80,9 +80,9 @@ fn read_settings(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-fn has_command(value: &Value, command: &str) -> bool {
+fn has_command(value: &Value, event: &str, command: &str) -> bool {
     value
-        .pointer("/hooks/PreToolUse")
+        .pointer(&format!("/hooks/{event}"))
         .and_then(Value::as_array)
         .is_some_and(|groups| groups.iter().any(|group| runs(group, command)))
 }
@@ -99,40 +99,46 @@ fn runs(group: &Value, command: &str) -> bool {
 }
 
 fn registered(path: &Path, agent: &dyn Agent) -> Result<bool> {
-    Ok(has_command(&read_settings(path)?, agent.command()))
+    Ok(has_command(
+        &read_settings(path)?,
+        "PreToolUse",
+        &hook_command(agent, "pre_tool_use"),
+    ))
 }
 
-/// Registers akhook for every tool call: without a matcher, the agent hands
-/// akhook all of them and the adapter decides which it understands, so
-/// supporting a new tool needs no new registration. An earlier registration
-/// limited to some tools by a matcher is widened in place.
+/// Registers akhook for each hook it handles (`HOOKS`). Tool calls are
+/// registered without a matcher: the agent hands akhook all of them and the
+/// adapter decides what it makes of each, so supporting a new tool needs no
+/// new registration. An earlier registration limited by a matcher is widened
+/// in place.
 fn install(path: &Path, agent: &dyn Agent) -> Result<()> {
     let mut value = read_settings(path)?;
-    let registered = has_command(&value, agent.command());
-    let object = value.as_object_mut().expect("validated object");
-    let hooks = object.entry("hooks").or_insert_with(|| json!({}));
-    let hooks = hooks.as_object_mut().context("hooks must be an object")?;
-    let groups = hooks.entry("PreToolUse").or_insert_with(|| json!([]));
-    let groups = groups
-        .as_array_mut()
-        .context("hooks.PreToolUse must be an array")?;
-    if registered {
-        let mut widened = false;
-        for group in groups
-            .iter_mut()
-            .filter(|group| runs(group, agent.command()))
-        {
-            if let Some(group) = group.as_object_mut() {
-                widened |= group.remove("matcher").is_some();
+    let mut changed = false;
+    for (event, action) in HOOKS {
+        let command = hook_command(agent, action);
+        let registered = has_command(&value, event, &command);
+        let object = value.as_object_mut().expect("validated object");
+        let hooks = object.entry("hooks").or_insert_with(|| json!({}));
+        let hooks = hooks.as_object_mut().context("hooks must be an object")?;
+        let groups = hooks.entry(event).or_insert_with(|| json!([]));
+        let groups = groups
+            .as_array_mut()
+            .with_context(|| format!("hooks.{event} must be an array"))?;
+        if registered {
+            for group in groups.iter_mut().filter(|group| runs(group, &command)) {
+                if let Some(group) = group.as_object_mut() {
+                    changed |= group.remove("matcher").is_some();
+                }
             }
+        } else {
+            groups.push(json!({
+                "hooks": [{"type": "command", "command": command}]
+            }));
+            changed = true;
         }
-        if !widened {
-            return Ok(());
-        }
-    } else {
-        groups.push(json!({
-            "hooks": [{"type": "command", "command": agent.command()}]
-        }));
+    }
+    if !changed {
+        return Ok(());
     }
     fs::create_dir_all(path.parent().context("settings has no parent")?)?;
     let mut output = serde_json::to_string_pretty(&value)?;
@@ -161,8 +167,11 @@ mod tests {
                 .len(),
             2
         );
-        assert!(has_command(&settings, "other"));
-        assert!(has_command(&settings, AgentKind::Codex.adapter().command()));
+        assert!(has_command(&settings, "PreToolUse", "other"));
+        let codex = AgentKind::Codex.adapter();
+        for (event, action) in HOOKS {
+            assert!(has_command(&settings, event, &hook_command(codex, action)));
+        }
         // Every tool call reaches akhook.
         assert!(settings.pointer("/hooks/PreToolUse/1/matcher").is_none());
         // Other hooks keep their matchers.
@@ -177,7 +186,7 @@ mod tests {
     fn widens_a_registration_limited_by_a_matcher() {
         let path =
             std::env::temp_dir().join(format!("akhook-init-old-{}.json", std::process::id()));
-        let command = AgentKind::Claude.adapter().command();
+        let command = hook_command(AgentKind::Claude.adapter(), "pre_tool_use");
         fs::write(
             &path,
             json!({"hooks": {"PreToolUse": [

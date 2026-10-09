@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     agents::{Agent, AgentKind},
+    config::RuleEvent,
     model::Decision,
     rules::RuleSet,
 };
@@ -48,6 +49,11 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// ADK agents: their hosts call these from callbacks (go/adk).
+    Adk {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// One-time approvals for `ask` rules on agents that cannot ask (Codex).
     Approval {
         #[command(subcommand)]
@@ -75,6 +81,13 @@ enum AgentCommand {
 enum HookAction {
     #[command(name = "pre_tool_use")]
     PreToolUse,
+    /// The user submitted a prompt: runs the prompt_submit rules, whose
+    /// output becomes the turn's context.
+    #[command(name = "prompt_submit")]
+    PromptSubmit,
+    /// The agent finished its turn: runs the stop rules.
+    #[command(name = "stop")]
+    Stop,
 }
 
 fn main() {
@@ -93,6 +106,7 @@ fn run() -> Result<()> {
         }
         Command::Claude { command } => hook(AgentKind::Claude.adapter(), command, &additional),
         Command::Codex { command } => hook(AgentKind::Codex.adapter(), command, &additional),
+        Command::Adk { command } => hook(AgentKind::Adk.adapter(), command, &additional),
         Command::Approval {
             command: ApprovalCommand::Show { id },
         } => {
@@ -106,9 +120,38 @@ fn run() -> Result<()> {
 }
 
 fn hook(agent: &dyn Agent, command: AgentCommand, additional: &[PathBuf]) -> Result<()> {
-    let AgentCommand::Hook {
-        action: HookAction::PreToolUse,
-    } = command;
+    let AgentCommand::Hook { action } = command;
+    match action {
+        HookAction::PreToolUse => pre_tool_use(agent, additional),
+        HookAction::PromptSubmit => lifecycle(RuleEvent::PromptSubmit, additional),
+        HookAction::Stop => lifecycle(RuleEvent::Stop, additional),
+    }
+}
+
+/// Lifecycle hooks never hold up the agent: whatever fails is reported on
+/// stderr and the hook answers nothing.
+fn lifecycle(event: RuleEvent, additional: &[PathBuf]) -> Result<()> {
+    let result = (|| {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .context("reading hook input")?;
+        let data = agents::lifecycle_event(&input)?;
+        let rules = RuleSet::new(config::load(&data.cwd, additional)?)?;
+        Ok::<_, anyhow::Error>(rules.lifecycle(event, &data))
+    })();
+    match result {
+        Ok(contexts) if event == RuleEvent::PromptSubmit && !contexts.is_empty() => {
+            let context = agents::context_json(&contexts.join("\n\n"));
+            println!("{}", serde_json::to_string(&context)?);
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("akhook: {error:#}"),
+    }
+    Ok(())
+}
+
+fn pre_tool_use(agent: &dyn Agent, additional: &[PathBuf]) -> Result<()> {
     let result = (|| {
         let mut input = String::new();
         io::stdin()
